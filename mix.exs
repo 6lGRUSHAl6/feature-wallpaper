@@ -7,13 +7,12 @@ defmodule FW.MixProject do
       version: "0.1.0",
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
-      compilers: Mix.compilers() ++ [:fw_renderer, :fw_init_units],
+      compilers: Mix.compilers() ++ [:fw_renderer],
       releases: releases(),
       deps: deps()
     ]
   end
 
-  # Run "mix help compile.app" to learn about applications.
   def application do
     [
       extra_applications: [:logger],
@@ -21,17 +20,17 @@ defmodule FW.MixProject do
     ]
   end
 
-  # Run "mix help deps" to learn about dependencies.
   defp deps do
-    [
-    ]
+    []
   end
 
   defp releases do
     [
       fw: [
         include_executables_for: [:unix],
-        steps: [:assemble, :tar]
+        # InitUnits runs after :assemble (binary exists) and before :tar
+        # (so unit files are included in the release tarball).
+        steps: [:assemble, &FW.Release.InitUnits.run/1, :tar]
       ]
     ]
   end
