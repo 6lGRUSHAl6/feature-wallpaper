@@ -7,7 +7,7 @@ defmodule FW.MixProject do
       version: "0.1.0",
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
-      compilers: Mix.compilers() ++ [:fw_renderer],
+      compilers: Mix.compilers() ++ [:fw_renderer, :fw_init_units],
       releases: releases(),
       deps: deps()
     ]
