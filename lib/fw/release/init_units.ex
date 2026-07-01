@@ -1,10 +1,12 @@
 defmodule FW.Release.InitUnits do
   @moduledoc """
-  Custom Mix release step that detects the running init system and
-  writes service unit files into the assembled release.
+  Custom Mix release step that:
 
-  Runs **after** `:assemble` (so the release binary already exists)
-  and **before** `:tar` (so the units are included in the tarball).
+  1. Detects the running init system (systemd, runit, s6).
+  2. Writes unit file templates into `releases/<vsn>/init/` (included in
+     the release tarball for reference / manual install on other machines).
+  3. **Installs and activates** the unit for the detected init system
+     automatically, so `mix release` is the only command needed.
 
   Configure in `mix.exs`:
 
@@ -15,24 +17,19 @@ defmodule FW.Release.InitUnits do
         ]
       ]
 
-  ## Generated files
+  ## Environment variables
 
-  All files are written under `<release_root>/releases/<vsn>/init/`:
-
-    - `systemd/fw.service`
-    - `runit/fw/run`, `runit/fw/finish`, `runit/fw/log/run`
-    - `s6/fw/run`, `s6/fw/finish`, `s6/fw/type`
-    - `s6/fw-log/run`, `s6/fw-log/type`
-    - `README.md`
+    * `FW_INSTALL_USER`  — override the username embedded in runit/s6
+      scripts (default: `$USER`).
+    * `FW_NO_INSTALL`    — set to any non-empty value to skip the live
+      install and only write the template files.
 
   ## Detection order
 
-  1. **systemd** — `/run/systemd/private` exists, or `INVOCATION_ID`
-     env var is set, or PID-1 (`/proc/1/comm`) is `systemd`.
-  2. **runit** — `/run/runit` exists, `/sbin/runit-init` exists,
-     or PID-1 is `runit`.
-  3. **s6** — `/run/s6` exists, `s6-svscan` in PATH, or PID-1 is `s6`.
-  4. **unknown** — warning printed, all templates still written.
+  1. **systemd** — `/run/systemd/private`, `INVOCATION_ID` env, or PID-1 name.
+  2. **runit**   — `/run/runit`, `/sbin/runit-init`, or PID-1 name.
+  3. **s6**      — `/run/s6`, `s6-svscan` in PATH, or PID-1 name.
+  4. **unknown** — templates written, install skipped with a warning.
   """
 
   @doc """
@@ -44,44 +41,141 @@ defmodule FW.Release.InitUnits do
     :ok = File.mkdir_p(init_dir)
 
     init = detect_init()
-    log("detected init system: #{init}")
+    username = System.get_env("FW_INSTALL_USER") ||
+               System.get_env("USER") ||
+               System.get_env("LOGNAME") ||
+               "nobody"
+    skip_install? = System.get_env("FW_NO_INSTALL") not in [nil, ""]
 
+    log("init system : #{init}")
+    log("user        : #{username}")
+
+    # Always write all templates so the tarball is self-contained.
     write_readme(init_dir, release)
-    write_for(init, init_dir, release)
+    write_systemd(init_dir, release)
+    write_runit(init_dir, release)
+    write_s6(init_dir, release)
+    log("templates written to #{Path.relative_to_cwd(init_dir)}/")
 
-    log("unit files written to #{Path.relative_to_cwd(init_dir)}/")
-    log("run `mix fw.install` to install and activate automatically")
+    if skip_install? do
+      log("FW_NO_INSTALL set — skipping live install")
+    else
+      install(init, release, username)
+    end
+
     release
   end
 
-  @doc """
-  Detects the running init system. Returns `:systemd`, `:runit`, `:s6`,
-  or `:unknown`. Public so `Mix.Tasks.Fw.Install` can reuse it.
-  """
+  @doc "Detects the running init system. Public for testing."
   def detect_init do
     cond do
       systemd?() -> :systemd
-      runit?() -> :runit
-      s6?() -> :s6
-      true -> :unknown
+      runit?()   -> :runit
+      s6?()      -> :s6
+      true       -> :unknown
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Release path helpers
+  # Install dispatch
   # ---------------------------------------------------------------------------
 
-  defp init_dir(%Mix.Release{version: vsn, path: root}) do
-    Path.join([root, "releases", vsn, "init"])
+  defp install(:unknown, _release, _username) do
+    log("WARNING: could not detect a supported init system.")
+    log("Install manually from the init/ directory in the release.")
   end
 
-  @doc "Absolute path to the release binary. Public for use in fw.install."
-  def bin_path(%Mix.Release{name: name, path: root}) do
-    Path.join([root, "bin", to_string(name)])
+  defp install(:systemd, release, _username) do
+    bin   = bin_path(release)
+    dest_dir = Path.expand("~/.config/systemd/user")
+    dest     = Path.join(dest_dir, "fw.service")
+
+    :ok = File.mkdir_p(dest_dir)
+
+    # Write unit with the real binary path baked in.
+    File.write!(dest, systemd_unit(bin))
+    log("installed #{dest}")
+
+    cmd!("systemctl", ["--user", "daemon-reload"])
+    cmd!("systemctl", ["--user", "enable", "fw"])
+    cmd!("systemctl", ["--user", "start",  "fw"])
+    log("✓ fw enabled and started via systemd")
+    log("  journalctl --user -u fw -f")
+  end
+
+  defp install(:runit, release, username) do
+    bin  = bin_path(release)
+    dest = "/etc/sv/fw"
+    symlink = "/var/service/fw"
+
+    # Write run/finish/log scripts to a temp dir, then sudo-copy.
+    tmp = Path.join(System.tmp_dir!(), "fw-runit-#{:os.getpid()}")
+    :ok = File.mkdir_p(Path.join(tmp, "log"))
+    uid = uid_for(username)
+
+    File.write!(Path.join(tmp, "run"),        runit_run(bin, username, uid), [:raw])
+    File.write!(Path.join(tmp, "finish"),      runit_finish(), [:raw])
+    File.write!(Path.join(Path.join(tmp, "log"), "run"), runit_log_run(), [:raw])
+    File.chmod!(Path.join(tmp, "run"),    0o755)
+    File.chmod!(Path.join(tmp, "finish"), 0o755)
+    File.chmod!(Path.join(Path.join(tmp, "log"), "run"), 0o755)
+
+    cmd!("sudo", ["cp", "-r", tmp, dest])
+    log("installed #{dest}")
+
+    unless File.exists?(symlink) do
+      cmd!("sudo", ["ln", "-s", dest, symlink])
+    end
+
+    cmd!("sv", ["start", "fw"])
+    log("✓ fw enabled and started via runit")
+    log("  sv status fw")
+  after
+    File.rm_rf(Path.join(System.tmp_dir!(), "fw-runit-#{:os.getpid()}"))
+  end
+
+  defp install(:s6, release, username) do
+    bin      = bin_path(release)
+    dest_base = "/etc/s6/sv"
+    dest_fw   = Path.join(dest_base, "fw")
+    dest_log  = Path.join(dest_base, "fw-log")
+
+    tmp = Path.join(System.tmp_dir!(), "fw-s6-#{:os.getpid()}")
+    tmp_fw  = Path.join(tmp, "fw")
+    tmp_log = Path.join(tmp, "fw-log")
+    :ok = File.mkdir_p(tmp_fw)
+    :ok = File.mkdir_p(tmp_log)
+
+    File.write!(Path.join(tmp_fw, "run"),    s6_run(bin, username), [:raw])
+    File.write!(Path.join(tmp_fw, "finish"), s6_finish(), [:raw])
+    File.write!(Path.join(tmp_fw, "type"),   "longrun\n")
+    File.write!(Path.join(tmp_log, "run"),   s6_log_run(), [:raw])
+    File.write!(Path.join(tmp_log, "type"),  "longrun\n")
+    File.chmod!(Path.join(tmp_fw, "run"),    0o755)
+    File.chmod!(Path.join(tmp_fw, "finish"), 0o755)
+    File.chmod!(Path.join(tmp_log, "run"),   0o755)
+
+    cmd!("sudo", ["cp", "-r", tmp_fw,  dest_fw])
+    cmd!("sudo", ["cp", "-r", tmp_log, dest_log])
+    log("installed #{dest_fw} and #{dest_log}")
+    log("✓ fw s6 service files installed")
+    log("  Next: symlink into your scan dir or run s6-rc change fw")
+  after
+    File.rm_rf(Path.join(System.tmp_dir!(), "fw-s6-#{:os.getpid()}"))
   end
 
   # ---------------------------------------------------------------------------
-  # Init detection (private helpers)
+  # Path helpers
+  # ---------------------------------------------------------------------------
+
+  defp init_dir(%Mix.Release{version: vsn, path: root}),
+    do: Path.join([root, "releases", vsn, "init"])
+
+  defp bin_path(%Mix.Release{name: name, path: root}),
+    do: Path.join([root, "bin", to_string(name)])
+
+  # ---------------------------------------------------------------------------
+  # Init detection
   # ---------------------------------------------------------------------------
 
   defp systemd? do
@@ -109,46 +203,20 @@ defmodule FW.Release.InitUnits do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Dispatch
-  # ---------------------------------------------------------------------------
-
-  defp write_for(:unknown, init_dir, release) do
-    log(
-      "WARNING: could not detect a supported init system (systemd/runit/s6). " <>
-        "Writing all templates anyway. " <>
-        "See #{Path.join(init_dir, "README.md")} for install instructions."
-    )
-
-    write_systemd(init_dir, release)
-    write_runit(init_dir, release)
-    write_s6(init_dir, release)
-  end
-
-  defp write_for(init, init_dir, release) do
-    write_systemd(init_dir, release)
-    write_runit(init_dir, release)
-    write_s6(init_dir, release)
-    log("detected #{init} — see init/#{init}/ for the recommended unit files")
+  defp uid_for(username) do
+    case System.cmd("id", ["-u", username], stderr_to_stdout: true) do
+      {uid, 0} -> String.trim(uid)
+      _ -> "1000"
+    end
   end
 
   # ---------------------------------------------------------------------------
-  # systemd
+  # Unit file content
   # ---------------------------------------------------------------------------
 
-  defp write_systemd(init_dir, release) do
-    dir = Path.join(init_dir, "systemd")
-    :ok = File.mkdir_p(dir)
-    write_file(Path.join(dir, "fw.service"), systemd_unit(release))
-  end
-
-  defp systemd_unit(release) do
-    bin = bin_path(release)
-
+  defp systemd_unit(bin) do
     """
-    # ~/.config/systemd/user/fw.service
-    # Installed automatically by `mix fw.install`.
-    # Manual install: see releases/#{release.version}/init/README.md
+    # Installed by `mix release` via FW.Release.InitUnits.
 
     [Unit]
     Description=fw — feature-wallpaper Wayland wallpaper daemon
@@ -179,34 +247,12 @@ defmodule FW.Release.InitUnits do
     """
   end
 
-  # ---------------------------------------------------------------------------
-  # runit
-  # ---------------------------------------------------------------------------
-
-  defp write_runit(init_dir, release) do
-    base = Path.join([init_dir, "runit", "fw"])
-    log_dir = Path.join(base, "log")
-    :ok = File.mkdir_p(log_dir)
-
-    write_file(Path.join(base, "run"), runit_run(release), mode: 0o755)
-    write_file(Path.join(base, "finish"), runit_finish(), mode: 0o755)
-    write_file(Path.join(log_dir, "run"), runit_log_run(), mode: 0o755)
-  end
-
-  defp runit_run(release) do
-    bin = bin_path(release)
-
+  defp runit_run(bin, username, uid) do
     """
     #!/bin/sh
-    # Installed to /etc/sv/fw/run by `mix fw.install`.
-    # YOURUSER is replaced with the real username at install time.
-
-    FW_USER=YOURUSER
-    FW_UID=$(id -u "${FW_USER}" 2>/dev/null || echo 1000)
-
-    exec chpst -u "${FW_USER}:${FW_USER}" \\
+    exec chpst -u #{username}:#{username} \\
       env WAYLAND_DISPLAY=wayland-1 \\
-          XDG_RUNTIME_DIR=/run/user/${FW_UID} \\
+          XDG_RUNTIME_DIR=/run/user/#{uid} \\
       #{bin} start
     """
   end
@@ -225,36 +271,12 @@ defmodule FW.Release.InitUnits do
     """
   end
 
-  # ---------------------------------------------------------------------------
-  # s6
-  # ---------------------------------------------------------------------------
-
-  defp write_s6(init_dir, release) do
-    base = Path.join([init_dir, "s6", "fw"])
-    log_dir = Path.join([init_dir, "s6", "fw-log"])
-    :ok = File.mkdir_p(base)
-    :ok = File.mkdir_p(log_dir)
-
-    write_file(Path.join(base, "run"), s6_run(release), mode: 0o755)
-    write_file(Path.join(base, "finish"), s6_finish(), mode: 0o755)
-    write_file(Path.join(base, "type"), "longrun\n")
-    write_file(Path.join(log_dir, "run"), s6_log_run(), mode: 0o755)
-    write_file(Path.join(log_dir, "type"), "longrun\n")
-  end
-
-  defp s6_run(release) do
-    bin = bin_path(release)
-
+  defp s6_run(bin, username) do
     """
     #!/bin/execlineb -P
-    # Installed to /etc/s6/sv/fw/run by `mix fw.install`.
-    # YOURUSER is replaced with the real username at install time.
-
     importas -D "wayland-1" WAYLAND_DISPLAY WAYLAND_DISPLAY
     importas -D "/run/user/1000" XDG_RUNTIME_DIR XDG_RUNTIME_DIR
-
-    s6-setuidgid YOURUSER
-
+    s6-setuidgid #{username}
     #{bin} start
     """
   end
@@ -275,47 +297,67 @@ defmodule FW.Release.InitUnits do
   end
 
   # ---------------------------------------------------------------------------
-  # README
+  # Template files (written into release tarball for reference)
   # ---------------------------------------------------------------------------
 
-  defp write_readme(init_dir, release) do
-    write_file(Path.join(init_dir, "README.md"), readme(release))
+  defp write_systemd(init_dir, release) do
+    dir = Path.join(init_dir, "systemd")
+    :ok = File.mkdir_p(dir)
+    File.write!(Path.join(dir, "fw.service"), systemd_unit(bin_path(release)))
   end
 
-  defp readme(release) do
-    vsn = release.version
+  defp write_runit(init_dir, release) do
+    base    = Path.join([init_dir, "runit", "fw"])
+    log_dir = Path.join(base, "log")
+    :ok = File.mkdir_p(log_dir)
+    bin = bin_path(release)
+    write_x(Path.join(base,    "run"),    runit_run(bin, "YOURUSER", "$(id -u YOURUSER)"))
+    write_x(Path.join(base,    "finish"), runit_finish())
+    write_x(Path.join(log_dir, "run"),    runit_log_run())
+  end
 
+  defp write_s6(init_dir, release) do
+    base    = Path.join([init_dir, "s6", "fw"])
+    log_dir = Path.join([init_dir, "s6", "fw-log"])
+    :ok = File.mkdir_p(base)
+    :ok = File.mkdir_p(log_dir)
+    bin = bin_path(release)
+    write_x(Path.join(base,    "run"),    s6_run(bin, "YOURUSER"))
+    write_x(Path.join(base,    "finish"), s6_finish())
+    File.write!(Path.join(base,    "type"), "longrun\n")
+    write_x(Path.join(log_dir, "run"),    s6_log_run())
+    File.write!(Path.join(log_dir, "type"), "longrun\n")
+  end
+
+  defp write_readme(init_dir, release) do
+    File.write!(Path.join(init_dir, "README.md"), readme(release.version))
+  end
+
+  defp readme(vsn) do
     """
     # fw — Init Unit Files (v#{vsn})
 
-    Generated by `mix release` via `FW.Release.InitUnits`.
+    These files were written by `mix release` via `FW.Release.InitUnits`.
+    The daemon was also installed and started automatically for the
+    detected init system.
 
-    ## Automatic install (recommended)
+    Set `FW_NO_INSTALL=1` before `mix release` to skip live install
+    and only generate the template files.
 
-        mix fw.install
-
-    Detects your init system, copies unit files to the right place,
-    and starts the daemon. Use `--dry-run` to preview first.
-
-    ## Manual install
+    ## Manual install (if needed)
 
     ### systemd
-
         mkdir -p ~/.config/systemd/user
-        cp releases/#{vsn}/init/systemd/fw.service ~/.config/systemd/user/fw.service
+        cp releases/#{vsn}/init/systemd/fw.service ~/.config/systemd/user/
         systemctl --user daemon-reload
         systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
         systemctl --user enable --now fw
 
     ### runit
-
-        # Edit run: set FW_USER=<youruser>
         sudo cp -r releases/#{vsn}/init/runit/fw /etc/sv/fw
         sudo ln -s /etc/sv/fw /var/service/fw
 
     ### s6
-
-        # Edit run: replace YOURUSER
         sudo cp -r releases/#{vsn}/init/s6/fw /etc/s6/sv/fw
         sudo cp -r releases/#{vsn}/init/s6/fw-log /etc/s6/sv/fw-log
     """
@@ -325,12 +367,16 @@ defmodule FW.Release.InitUnits do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp write_file(path, content, opts \\ []) do
-    :ok = File.mkdir_p(Path.dirname(path))
-    :ok = File.write(path, content)
+  defp write_x(path, content) do
+    File.write!(path, content)
+    File.chmod!(path, 0o755)
+  end
 
-    if mode = Keyword.get(opts, :mode) do
-      File.chmod!(path, mode)
+  defp cmd!(bin, args) do
+    case System.cmd(bin, args, stderr_to_stdout: true, into: IO.stream()) do
+      {_, 0} -> :ok
+      {out, code} ->
+        Mix.raise("Command failed (exit #{code}): #{bin} #{Enum.join(args, " ")}\n#{out}")
     end
   end
 
