@@ -133,7 +133,7 @@ defmodule FW.JSON do
   defp parse_string(<<char::utf8, rest::binary>>, acc), do: parse_string(rest, <<acc::binary, char::utf8>>)
   defp parse_string(<<>>, _acc), do: {:error, :unterminated_string}
 
-  defp parse_number(binary) do
+defp parse_number(binary) do
     regex = ~r/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/
 
     case Regex.run(regex, binary, capture: :first) do
@@ -141,8 +141,10 @@ defmodule FW.JSON do
         rest = binary_part(binary, byte_size(number), byte_size(binary) - byte_size(number))
 
         case Integer.parse(number) do
-          {int, ""} -> {:ok, int, rest}
-          :error ->
+          {int, ""} -> 
+            {:ok, int, rest}
+
+          _other ->
             case Float.parse(number) do
               {float, ""} -> {:ok, float, rest}
               _ -> {:error, :invalid_number}

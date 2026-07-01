@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +35,8 @@ struct render_buffer {
   int fd;
   int width;
   int height;
+  bool released;   /* compositor sent wl_buffer.release */
+  bool retire;      /* superseded by a newer buffer; free once released */
 };
 
 struct output_state {
@@ -41,6 +44,7 @@ struct output_state {
   struct wl_output *wl_output;
   struct wl_surface *surface;
   struct zwlr_layer_surface_v1 *layer_surface;
+  struct render_buffer *current_buffer; /* buffer currently attached */
   char name[128];
   int configured_width;
   int configured_height;
@@ -48,6 +52,7 @@ struct output_state {
   int output_height;
   int scale;
   bool has_mode;
+  bool has_geometry;
   bool configured;
   bool closed;
 };
@@ -59,22 +64,103 @@ struct renderer_context {
   struct wl_shm *shm;
   struct zwlr_layer_shell_v1 *layer_shell;
   struct wl_list outputs;
-  struct wl_list buffers;
+  struct wl_list buffers; /* all buffers not yet fully freed */
   int output_count;
 };
 
 static struct renderer_context g_ctx;
+static cairo_user_data_key_t g_pixel_data_key;
+
+/* ---------------------------------------------------------------------- */
+/* JSON output helpers                                                    */
+/* ---------------------------------------------------------------------- */
+
+static void json_escape_into(const char *input, char *output, size_t out_size) {
+  size_t index = 0;
+  if (input == NULL) {
+    output[0] = '\0';
+    return;
+  }
+
+  for (size_t i = 0; input[i] != '\0' && index + 2 < out_size; ++i) {
+    unsigned char ch = (unsigned char)input[i];
+    switch (ch) {
+      case '"':
+        output[index++] = '\\';
+        output[index++] = '"';
+        break;
+      case '\\':
+        output[index++] = '\\';
+        output[index++] = '\\';
+        break;
+      case '\n':
+        output[index++] = '\\';
+        output[index++] = 'n';
+        break;
+      case '\r':
+        output[index++] = '\\';
+        output[index++] = 'r';
+        break;
+      case '\t':
+        output[index++] = '\\';
+        output[index++] = 't';
+        break;
+      default:
+        if (ch < 0x20) {
+          /* skip other control characters rather than emit invalid JSON */
+          continue;
+        }
+        output[index++] = (char)ch;
+        break;
+    }
+  }
+
+  output[index] = '\0';
+}
 
 static void write_reply(const char *id, const char *status, const char *command, const char *message) {
-  printf("{\"id\":\"%s\",\"status\":\"%s\",\"command\":\"%s\",\"message\":\"%s\"}\n", id, status, command, message);
+  char safe_id[256];
+  char safe_status[64];
+  char safe_command[256];
+  char safe_message[1024];
+
+  json_escape_into(id, safe_id, sizeof(safe_id));
+  json_escape_into(status, safe_status, sizeof(safe_status));
+  json_escape_into(command, safe_command, sizeof(safe_command));
+  json_escape_into(message, safe_message, sizeof(safe_message));
+
+  printf("{\"id\":\"%s\",\"status\":\"%s\",\"command\":\"%s\",\"message\":\"%s\"}\n",
+         safe_id, safe_status, safe_command, safe_message);
   fflush(stdout);
 }
+
+/* ---------------------------------------------------------------------- */
+/* Minimal JSON field extraction (flat, string-valued fields only)        */
+/* ---------------------------------------------------------------------- */
 
 static const char *extract_value(const char *json, const char *key, char *buffer, size_t size) {
   char pattern[128];
   snprintf(pattern, sizeof(pattern), "\"%s\"", key);
 
-  const char *position = strstr(json, pattern);
+  const char *search_from = json;
+  const char *position = NULL;
+
+  /* Find a match on a proper key boundary (preceded by '{', ',', or whitespace)
+   * to reduce (not eliminate) false matches against substrings of other keys. */
+  while ((position = strstr(search_from, pattern)) != NULL) {
+    const char *before = position;
+    bool boundary_ok = true;
+    if (before != json) {
+      char prev = *(before - 1);
+      boundary_ok = (prev == '{' || prev == ',' || prev == ' ' || prev == '\t' ||
+                     prev == '\n' || prev == '\r');
+    }
+    if (boundary_ok) {
+      break;
+    }
+    search_from = position + 1;
+  }
+
   if (position == NULL) {
     return NULL;
   }
@@ -83,23 +169,32 @@ static const char *extract_value(const char *json, const char *key, char *buffer
   if (position == NULL) {
     return NULL;
   }
+  position++;
 
-  while (*position != '\0' && (*position == ':' || *position == ' ' || *position == '\t' || *position == '\n' || *position == '\r')) {
+  while (*position == ' ' || *position == '\t' || *position == '\n' || *position == '\r') {
     position++;
   }
 
   if (*position != '"') {
     return NULL;
   }
-
   position++;
-  size_t index = 0;
 
+  size_t index = 0;
   while (*position != '\0' && *position != '"' && index + 1 < size) {
     if (*position == '\\' && position[1] != '\0') {
       position++;
+      switch (*position) {
+        case 'n': buffer[index++] = '\n'; break;
+        case 't': buffer[index++] = '\t'; break;
+        case 'r': buffer[index++] = '\r'; break;
+        case '"': buffer[index++] = '"'; break;
+        case '\\': buffer[index++] = '\\'; break;
+        default: buffer[index++] = *position; break;
+      }
+      position++;
+      continue;
     }
-
     buffer[index++] = *position++;
   }
 
@@ -111,41 +206,27 @@ static enum wallpaper_mode parse_wallpaper_mode(const char *value) {
   if (value == NULL || value[0] == '\0') {
     return WALLPAPER_FIT;
   }
-
-  if (strcmp(value, "fill") == 0) {
-    return WALLPAPER_FILL;
-  }
-
-  if (strcmp(value, "stretch") == 0) {
-    return WALLPAPER_STRETCH;
-  }
-
-  if (strcmp(value, "center") == 0) {
-    return WALLPAPER_CENTER;
-  }
-
-  if (strcmp(value, "tile") == 0) {
-    return WALLPAPER_TILE;
-  }
-
+  if (strcmp(value, "fill") == 0) return WALLPAPER_FILL;
+  if (strcmp(value, "stretch") == 0) return WALLPAPER_STRETCH;
+  if (strcmp(value, "center") == 0) return WALLPAPER_CENTER;
+  if (strcmp(value, "tile") == 0) return WALLPAPER_TILE;
   return WALLPAPER_FIT;
 }
 
 static const char *mode_to_string(enum wallpaper_mode mode) {
   switch (mode) {
-    case WALLPAPER_FILL:
-      return "fill";
-    case WALLPAPER_STRETCH:
-      return "stretch";
-    case WALLPAPER_CENTER:
-      return "center";
-    case WALLPAPER_TILE:
-      return "tile";
+    case WALLPAPER_FILL: return "fill";
+    case WALLPAPER_STRETCH: return "stretch";
+    case WALLPAPER_CENTER: return "center";
+    case WALLPAPER_TILE: return "tile";
     case WALLPAPER_FIT:
-    default:
-      return "fit";
+    default: return "fit";
   }
 }
+
+/* ---------------------------------------------------------------------- */
+/* KDE Plasma DBus fallback                                               */
+/* ---------------------------------------------------------------------- */
 
 static int run_program(char *const argv[]) {
   pid_t pid = fork();
@@ -181,21 +262,13 @@ static void build_file_uri(const char *path, char *output, size_t size) {
   for (size_t i = 0; path[i] != '\0' && index + 4 < size; ++i) {
     unsigned char ch = (unsigned char)path[i];
     if (ch == ' ') {
-      output[index++] = '%';
-      output[index++] = '2';
-      output[index++] = '0';
+      output[index++] = '%'; output[index++] = '2'; output[index++] = '0';
     } else if (ch == '%') {
-      output[index++] = '%';
-      output[index++] = '2';
-      output[index++] = '5';
+      output[index++] = '%'; output[index++] = '2'; output[index++] = '5';
     } else if (ch == '#') {
-      output[index++] = '%';
-      output[index++] = '2';
-      output[index++] = '3';
+      output[index++] = '%'; output[index++] = '2'; output[index++] = '3';
     } else if (ch == '?') {
-      output[index++] = '%';
-      output[index++] = '3';
-      output[index++] = 'F';
+      output[index++] = '%'; output[index++] = '3'; output[index++] = 'F';
     } else {
       output[index++] = (char)ch;
     }
@@ -226,8 +299,7 @@ static int apply_plasma_wallpaper(const char *path, char *error, size_t error_si
   escaped_uri[index] = '\0';
 
   snprintf(
-    script,
-    sizeof(script),
+    script, sizeof(script),
     "var desktops = desktops();"
     "for (var i = 0; i < desktops.length; ++i) {"
     "  var d = desktops[i];"
@@ -240,17 +312,9 @@ static int apply_plasma_wallpaper(const char *path, char *error, size_t error_si
   );
 
   char *const argv[] = {
-    "gdbus",
-    "call",
-    "--session",
-    "--dest",
-    "org.kde.plasmashell",
-    "--object-path",
-    "/PlasmaShell",
-    "--method",
-    "org.kde.PlasmaShell.evaluateScript",
-    script,
-    NULL
+    "gdbus", "call", "--session", "--dest", "org.kde.plasmashell",
+    "--object-path", "/PlasmaShell", "--method",
+    "org.kde.PlasmaShell.evaluateScript", script, NULL
   };
 
   int rc = run_program(argv);
@@ -263,29 +327,23 @@ static int apply_plasma_wallpaper(const char *path, char *error, size_t error_si
   return 0;
 }
 
-static int should_use_plasma_backend(void) {
+static bool is_kde_session(void) {
   const char *desktop = getenv("XDG_CURRENT_DESKTOP");
-  const char *session = getenv("XDG_SESSION_TYPE");
-
-  if (desktop != NULL && (strstr(desktop, "KDE") != NULL || strstr(desktop, "Plasma") != NULL)) {
-    return 1;
-  }
-
-  if (session != NULL && strcmp(session, "wayland") == 0 && desktop != NULL && strstr(desktop, "KDE") != NULL) {
-    return 1;
-  }
-
-  return 0;
+  return desktop != NULL && (strstr(desktop, "KDE") != NULL || strstr(desktop, "Plasma") != NULL);
 }
 
+/* ---------------------------------------------------------------------- */
+/* SHM buffer lifecycle                                                   */
+/* ---------------------------------------------------------------------- */
+
 static int create_shm_file(size_t size) {
-  char template[] = "/tmp/fw-shm-XXXXXX";
-  int fd = mkstemp(template);
+  char shm_template[] = "/tmp/fw-shm-XXXXXX";
+  int fd = mkstemp(shm_template);
   if (fd < 0) {
     return -1;
   }
 
-  unlink(template);
+  unlink(shm_template);
 
   if (ftruncate(fd, (off_t)size) < 0) {
     close(fd);
@@ -295,50 +353,54 @@ static int create_shm_file(size_t size) {
   return fd;
 }
 
-static cairo_surface_t *pixbuf_to_cairo_surface(GdkPixbuf *pixbuf) {
-  int width = gdk_pixbuf_get_width(pixbuf);
-  int height = gdk_pixbuf_get_height(pixbuf);
-  int rowstride = gdk_pixbuf_get_rowstride(pixbuf);
-  int channels = gdk_pixbuf_get_n_channels(pixbuf);
-  gboolean has_alpha = gdk_pixbuf_get_has_alpha(pixbuf);
-  guchar *pixels = gdk_pixbuf_get_pixels(pixbuf);
-  size_t stride = (size_t)width * 4;
-  uint32_t *data = calloc((size_t)height, stride);
-
-  if (data == NULL) {
-    return NULL;
+static void render_buffer_free(struct render_buffer *buffer) {
+  if (buffer == NULL) {
+    return;
   }
-
-  for (int y = 0; y < height; ++y) {
-    uint32_t *row = (uint32_t *)((uint8_t *)data + (size_t)y * stride);
-    guchar *src = pixels + (size_t)y * rowstride;
-
-    for (int x = 0; x < width; ++x) {
-      guchar *p = src + (size_t)x * channels;
-      uint8_t red = p[0];
-      uint8_t green = p[1];
-      uint8_t blue = p[2];
-      uint8_t alpha = has_alpha ? p[3] : 255;
-
-      uint8_t premultiplied_red = (uint8_t)((red * alpha + 127) / 255);
-      uint8_t premultiplied_green = (uint8_t)((green * alpha + 127) / 255);
-      uint8_t premultiplied_blue = (uint8_t)((blue * alpha + 127) / 255);
-
-      row[x] = ((uint32_t)alpha << 24) |
-               ((uint32_t)premultiplied_red << 16) |
-               ((uint32_t)premultiplied_green << 8) |
-               (uint32_t)premultiplied_blue;
-    }
+  wl_list_remove(&buffer->link);
+  if (buffer->buffer != NULL) {
+    wl_buffer_destroy(buffer->buffer);
   }
-
-  cairo_surface_t *surface = cairo_image_surface_create_for_data((unsigned char *)data, CAIRO_FORMAT_ARGB32, width, height, (int)stride);
-  if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-    free(data);
-    cairo_surface_destroy(surface);
-    return NULL;
+  if (buffer->data != NULL && buffer->size > 0) {
+    munmap(buffer->data, buffer->size);
   }
+  if (buffer->fd >= 0) {
+    close(buffer->fd);
+  }
+  free(buffer);
+}
 
-  return surface;
+static void buffer_handle_release(void *data, struct wl_buffer *wl_buffer) {
+  (void)wl_buffer;
+  struct render_buffer *buffer = data;
+  buffer->released = true;
+  if (buffer->retire) {
+    render_buffer_free(buffer);
+  }
+}
+
+static const struct wl_buffer_listener buffer_listener = {
+  .release = buffer_handle_release,
+};
+
+/* Marks a buffer as superseded; frees it immediately if the compositor
+ * already released it, otherwise defers until the release event arrives. */
+static void render_buffer_retire(struct render_buffer *buffer) {
+  if (buffer == NULL) {
+    return;
+  }
+  buffer->retire = true;
+  if (buffer->released) {
+    render_buffer_free(buffer);
+  }
+}
+
+static void destroy_all_render_buffers(struct renderer_context *ctx) {
+  struct render_buffer *buffer;
+  struct render_buffer *tmp;
+  wl_list_for_each_safe(buffer, tmp, &ctx->buffers, link) {
+    render_buffer_free(buffer);
+  }
 }
 
 static struct render_buffer *create_render_buffer(struct renderer_context *ctx, int width, int height) {
@@ -385,28 +447,68 @@ static struct render_buffer *create_render_buffer(struct renderer_context *ctx, 
   result->fd = fd;
   result->width = width;
   result->height = height;
+  result->released = false;
+  result->retire = false;
   wl_list_insert(&ctx->buffers, &result->link);
+  wl_buffer_add_listener(buffer, &buffer_listener, result);
 
   return result;
 }
 
-static void destroy_render_buffers(struct renderer_context *ctx) {
-  struct render_buffer *buffer;
-  struct render_buffer *tmp;
+/* ---------------------------------------------------------------------- */
+/* Image decoding / drawing                                               */
+/* ---------------------------------------------------------------------- */
 
-  wl_list_for_each_safe(buffer, tmp, &ctx->buffers, link) {
-    wl_list_remove(&buffer->link);
-    if (buffer->buffer != NULL) {
-      wl_buffer_destroy(buffer->buffer);
-    }
-    if (buffer->data != NULL && buffer->size > 0) {
-      munmap(buffer->data, buffer->size);
-    }
-    if (buffer->fd >= 0) {
-      close(buffer->fd);
-    }
-    free(buffer);
+static cairo_surface_t *pixbuf_to_cairo_surface(GdkPixbuf *pixbuf) {
+  int width = gdk_pixbuf_get_width(pixbuf);
+  int height = gdk_pixbuf_get_height(pixbuf);
+  int rowstride = gdk_pixbuf_get_rowstride(pixbuf);
+  int channels = gdk_pixbuf_get_n_channels(pixbuf);
+  gboolean has_alpha = gdk_pixbuf_get_has_alpha(pixbuf);
+  guchar *pixels = gdk_pixbuf_get_pixels(pixbuf);
+  size_t stride = (size_t)width * 4;
+  uint32_t *data = calloc((size_t)height, stride);
+
+  if (data == NULL) {
+    return NULL;
   }
+
+  for (int y = 0; y < height; ++y) {
+    uint32_t *row = (uint32_t *)((uint8_t *)data + (size_t)y * stride);
+    guchar *src = pixels + (size_t)y * rowstride;
+
+    for (int x = 0; x < width; ++x) {
+      guchar *p = src + (size_t)x * channels;
+      uint8_t red = p[0];
+      uint8_t green = p[1];
+      uint8_t blue = p[2];
+      uint8_t alpha = has_alpha ? p[3] : 255;
+
+      uint8_t premultiplied_red = (uint8_t)((red * alpha + 127) / 255);
+      uint8_t premultiplied_green = (uint8_t)((green * alpha + 127) / 255);
+      uint8_t premultiplied_blue = (uint8_t)((blue * alpha + 127) / 255);
+
+      row[x] = ((uint32_t)alpha << 24) |
+               ((uint32_t)premultiplied_red << 16) |
+               ((uint32_t)premultiplied_green << 8) |
+               (uint32_t)premultiplied_blue;
+    }
+  }
+
+  cairo_surface_t *surface = cairo_image_surface_create_for_data(
+      (unsigned char *)data, CAIRO_FORMAT_ARGB32, width, height, (int)stride);
+
+  if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+    free(data);
+    cairo_surface_destroy(surface);
+    return NULL;
+  }
+
+  /* Tie the lifetime of `data` to the surface so cairo_surface_destroy()
+   * actually frees it instead of leaking it (this was the main leak). */
+  cairo_surface_set_user_data(surface, &g_pixel_data_key, data, free);
+
+  return surface;
 }
 
 static int draw_image_to_buffer(struct render_buffer *buffer, GdkPixbuf *pixbuf, enum wallpaper_mode mode) {
@@ -415,7 +517,9 @@ static int draw_image_to_buffer(struct render_buffer *buffer, GdkPixbuf *pixbuf,
     return -1;
   }
 
-  cairo_surface_t *target_surface = cairo_image_surface_create_for_data((unsigned char *)buffer->data, CAIRO_FORMAT_ARGB32, buffer->width, buffer->height, buffer->width * 4);
+  cairo_surface_t *target_surface = cairo_image_surface_create_for_data(
+      (unsigned char *)buffer->data, CAIRO_FORMAT_ARGB32, buffer->width, buffer->height, buffer->width * 4);
+
   if (cairo_surface_status(target_surface) != CAIRO_STATUS_SUCCESS) {
     cairo_surface_destroy(source_surface);
     return -1;
@@ -480,28 +584,27 @@ static int draw_image_to_buffer(struct render_buffer *buffer, GdkPixbuf *pixbuf,
   cairo_destroy(cr);
   cairo_surface_flush(target_surface);
   cairo_surface_destroy(target_surface);
-  cairo_surface_destroy(source_surface);
+  cairo_surface_destroy(source_surface); /* now also frees pixel data via user_data */
   return 0;
 }
 
-static void output_handle_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y, int32_t physical_width, int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
+/* ---------------------------------------------------------------------- */
+/* Wayland listeners                                                      */
+/* ---------------------------------------------------------------------- */
+
+static void output_handle_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y,
+                                    int32_t physical_width, int32_t physical_height, int32_t subpixel,
+                                    const char *make, const char *model, int32_t transform) {
   struct output_state *output = data;
-  (void)wl_output;
-  (void)x;
-  (void)y;
-  (void)physical_width;
-  (void)physical_height;
-  (void)subpixel;
-  (void)make;
-  (void)model;
-  (void)transform;
-  output->has_mode = false;
+  (void)wl_output; (void)x; (void)y; (void)physical_width; (void)physical_height;
+  (void)subpixel; (void)make; (void)model; (void)transform;
+  output->has_geometry = true;
 }
 
-static void output_handle_mode(void *data, struct wl_output *wl_output, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
+static void output_handle_mode(void *data, struct wl_output *wl_output, uint32_t flags,
+                                int32_t width, int32_t height, int32_t refresh) {
   struct output_state *output = data;
-  (void)wl_output;
-  (void)refresh;
+  (void)wl_output; (void)refresh;
 
   if (flags & WL_OUTPUT_MODE_CURRENT) {
     output->output_width = width;
@@ -511,9 +614,11 @@ static void output_handle_mode(void *data, struct wl_output *wl_output, uint32_t
 }
 
 static void output_handle_done(void *data, struct wl_output *wl_output) {
-  struct output_state *output = data;
+  /* All geometry/mode/scale/name events for this output have now arrived.
+   * Nothing further to compute here yet, but this is the correct hook
+   * point for any future "output info complete" logic. */
+  (void)data;
   (void)wl_output;
-  output->configured = output->configured;
 }
 
 static void output_handle_scale(void *data, struct wl_output *wl_output, int32_t factor) {
@@ -531,9 +636,7 @@ static void output_handle_name(void *data, struct wl_output *wl_output, const ch
 }
 
 static void output_handle_description(void *data, struct wl_output *wl_output, const char *description) {
-  (void)data;
-  (void)wl_output;
-  (void)description;
+  (void)data; (void)wl_output; (void)description;
 }
 
 static const struct wl_output_listener output_listener = {
@@ -545,7 +648,8 @@ static const struct wl_output_listener output_listener = {
   .description = output_handle_description,
 };
 
-static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface, uint32_t serial, uint32_t width, uint32_t height) {
+static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface,
+                                     uint32_t serial, uint32_t width, uint32_t height) {
   struct output_state *output = data;
   output->configured_width = (int)width;
   output->configured_height = (int)height;
@@ -569,14 +673,17 @@ static void output_destroy(struct output_state *output) {
     return;
   }
 
+  if (output->current_buffer != NULL) {
+    render_buffer_retire(output->current_buffer);
+    output->current_buffer = NULL;
+  }
+
   if (output->layer_surface != NULL) {
     zwlr_layer_surface_v1_destroy(output->layer_surface);
   }
-
   if (output->surface != NULL) {
     wl_surface_destroy(output->surface);
   }
-
   if (output->wl_output != NULL) {
     wl_output_destroy(output->wl_output);
   }
@@ -590,15 +697,22 @@ static int create_output_surface(struct renderer_context *ctx, struct output_sta
     return -1;
   }
 
-  output->layer_surface = zwlr_layer_shell_v1_get_layer_surface(ctx->layer_shell, output->surface, output->wl_output, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "fw");
+  output->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+      ctx->layer_shell, output->surface, output->wl_output,
+      ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "fw");
+
   if (output->layer_surface == NULL) {
     return -1;
   }
 
   zwlr_layer_surface_v1_add_listener(output->layer_surface, &layer_surface_listener, output);
-  zwlr_layer_surface_v1_set_anchor(output->layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+  zwlr_layer_surface_v1_set_anchor(
+      output->layer_surface,
+      ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+      ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
   zwlr_layer_surface_v1_set_exclusive_zone(output->layer_surface, -1);
-  zwlr_layer_surface_v1_set_keyboard_interactivity(output->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+  zwlr_layer_surface_v1_set_keyboard_interactivity(
+      output->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
   zwlr_layer_surface_v1_set_margin(output->layer_surface, 0, 0, 0, 0);
   zwlr_layer_surface_v1_set_size(output->layer_surface, 0, 0);
   wl_surface_commit(output->surface);
@@ -606,7 +720,8 @@ static int create_output_surface(struct renderer_context *ctx, struct output_sta
   return 0;
 }
 
-static void registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
+static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
+                             const char *interface, uint32_t version) {
   struct renderer_context *ctx = data;
 
   if (strcmp(interface, wl_compositor_interface.name) == 0) {
@@ -705,7 +820,6 @@ static int prepare_layer_surfaces(struct renderer_context *ctx, char *error, siz
       snprintf(error, error_size, "an output closed before configuration completed");
       return -1;
     }
-
     if (!output->configured) {
       snprintf(error, error_size, "timed out waiting for layer-shell configure");
       return -1;
@@ -715,7 +829,8 @@ static int prepare_layer_surfaces(struct renderer_context *ctx, char *error, siz
   return 0;
 }
 
-static int render_wallpaper_to_outputs(struct renderer_context *ctx, GdkPixbuf *pixbuf, enum wallpaper_mode mode, char *error, size_t error_size) {
+static int render_wallpaper_to_outputs(struct renderer_context *ctx, GdkPixbuf *pixbuf,
+                                        enum wallpaper_mode mode, char *error, size_t error_size) {
   struct output_state *output;
   wl_list_for_each(output, &ctx->outputs, link) {
     int logical_width = output->configured_width > 0 ? output->configured_width : output->output_width;
@@ -743,6 +858,7 @@ static int render_wallpaper_to_outputs(struct renderer_context *ctx, GdkPixbuf *
 
     if (draw_image_to_buffer(render_buffer, pixbuf, mode) != 0) {
       snprintf(error, error_size, "failed to draw wallpaper image");
+      render_buffer_retire(render_buffer);
       return -1;
     }
 
@@ -750,6 +866,15 @@ static int render_wallpaper_to_outputs(struct renderer_context *ctx, GdkPixbuf *
     wl_surface_attach(output->surface, render_buffer->buffer, 0, 0);
     wl_surface_damage_buffer(output->surface, 0, 0, buffer_width, buffer_height);
     wl_surface_commit(output->surface);
+
+    /* Retire the previously attached buffer for this output now that the
+     * new one has been committed; it is freed once the compositor releases
+     * it (or immediately if already released). This is what stops the
+     * unbounded SHM buffer growth on every wallpaper change. */
+    if (output->current_buffer != NULL && output->current_buffer != render_buffer) {
+      render_buffer_retire(output->current_buffer);
+    }
+    output->current_buffer = render_buffer;
   }
 
   if (wl_display_flush(ctx->display) < 0) {
@@ -786,21 +911,41 @@ static int apply_layer_shell_wallpaper(const char *path, const char *scaling, ch
   }
 
   g_object_unref(pixbuf);
-  snprintf(error, error_size, "wallpaper applied via native wlr-layer-shell (%s)", mode_to_string(parse_wallpaper_mode(scaling)));
+  snprintf(error, error_size, "wallpaper applied via native wlr-layer-shell (%s)",
+           mode_to_string(parse_wallpaper_mode(scaling)));
   return 0;
 }
 
+/* Native wlr-layer-shell is the primary path everywhere, including KDE
+ * (which also implements the protocol). The DBus/gdbus route is only a
+ * fallback for the rare case where layer-shell setup genuinely fails on
+ * a given KDE build. */
 static int apply_wallpaper(const char *path, const char *scaling, char *error, size_t error_size) {
-  if (should_use_plasma_backend()) {
-    return apply_plasma_wallpaper(path, error, error_size);
+  int rc = apply_layer_shell_wallpaper(path, scaling, error, error_size);
+  if (rc == 0) {
+    return 0;
   }
 
-  return apply_layer_shell_wallpaper(path, scaling, error, error_size);
+  if (is_kde_session()) {
+    /* Truncated deliberately: this snippet gets re-embedded into a fixed
+     * "layer-shell failed (...); plasma fallback also failed" message
+     * below, so it must leave enough room in `error` for that wrapper
+     * text regardless of how large `error_size` is. */
+    char layer_shell_error[200];
+    snprintf(layer_shell_error, sizeof(layer_shell_error), "%.199s", error);
+
+    int plasma_rc = apply_plasma_wallpaper(path, error, error_size);
+    if (plasma_rc != 0) {
+      /* Preserve the more informative original failure reason. */
+      snprintf(error, error_size, "layer-shell failed (%.200s); plasma fallback also failed", layer_shell_error);
+    }
+    return plasma_rc;
+  }
+
+  return rc;
 }
 
 static void destroy_context(struct renderer_context *ctx) {
-  destroy_render_buffers(ctx);
-
   struct output_state *output;
   struct output_state *tmp;
   wl_list_for_each_safe(output, tmp, &ctx->outputs, link) {
@@ -808,97 +953,169 @@ static void destroy_context(struct renderer_context *ctx) {
     output_destroy(output);
   }
 
+  destroy_all_render_buffers(ctx);
+
   if (ctx->layer_shell != NULL) {
     zwlr_layer_shell_v1_destroy(ctx->layer_shell);
     ctx->layer_shell = NULL;
   }
-
   if (ctx->shm != NULL) {
     wl_shm_destroy(ctx->shm);
     ctx->shm = NULL;
   }
-
   if (ctx->compositor != NULL) {
     wl_compositor_destroy(ctx->compositor);
     ctx->compositor = NULL;
   }
-
   if (ctx->registry != NULL) {
     wl_registry_destroy(ctx->registry);
     ctx->registry = NULL;
   }
-
   if (ctx->display != NULL) {
     wl_display_disconnect(ctx->display);
     ctx->display = NULL;
   }
 }
 
-int main(void) {
-  init_context(&g_ctx);
+/* ---------------------------------------------------------------------- */
+/* Command dispatch                                                       */
+/* ---------------------------------------------------------------------- */
 
-  char line[4096];
+static void handle_command_line(const char *line) {
   char id[256];
   char command[256];
+
+  if (extract_value(line, "id", id, sizeof(id)) == NULL) {
+    strcpy(id, "0");
+  }
+  if (extract_value(line, "command", command, sizeof(command)) == NULL) {
+    strcpy(command, "unknown");
+  }
+
+  fprintf(stderr, "fw_renderer: command=%s id=%s\n", command, id);
+  fflush(stderr);
+
+  if (strcmp(command, "shutdown") == 0) {
+    write_reply(id, "ok", command, "renderer stopping");
+    destroy_context(&g_ctx);
+    fprintf(stderr, "fw_renderer: exit\n");
+    fflush(stderr);
+    exit(0);
+  }
+
+  if (strcmp(command, "ping") == 0) {
+    write_reply(id, "ok", command, "pong from native Wayland renderer");
+    return;
+  }
+
+  if (strcmp(command, "status") == 0) {
+    write_reply(id, "ok", command, g_ctx.display != NULL ? "native renderer ready" : "renderer not connected");
+    return;
+  }
+
+  if (strcmp(command, "apply") == 0) {
+    char path[2048];
+    char scaling[128];
+    char reply[512];
+
+    if (extract_value(line, "path", path, sizeof(path)) == NULL || path[0] == '\0') {
+      write_reply(id, "error", command, "missing wallpaper path");
+      return;
+    }
+
+    if (extract_value(line, "scaling", scaling, sizeof(scaling)) == NULL) {
+      scaling[0] = '\0';
+    }
+
+    if (apply_wallpaper(path, scaling, reply, sizeof(reply)) != 0) {
+      write_reply(id, "error", command, reply);
+    } else {
+      write_reply(id, "ok", command, reply);
+    }
+    return;
+  }
+
+  write_reply(id, "error", command, "unsupported command");
+}
+
+/* Reads one line from stdin. Returns 1 on a complete line, 0 on EOF,
+ * -1 if the line exceeded the buffer (the remainder is drained and an
+ * error is reported so the protocol doesn't desync). */
+static int read_command_line(char *line, size_t size) {
+  if (fgets(line, (int)size, stdin) == NULL) {
+    return 0;
+  }
+
+  size_t length = strlen(line);
+  if (length > 0 && line[length - 1] == '\n') {
+    line[length - 1] = '\0';
+    return 1;
+  }
+
+  /* Buffer filled without hitting a newline: drain the rest of the
+   * oversized line so the next read starts on a clean boundary. */
+  int ch;
+  while ((ch = getchar()) != '\n' && ch != EOF) {
+    /* discard */
+  }
+  return -1;
+}
+
+int main(void) {
+  init_context(&g_ctx);
 
   fprintf(stderr, "fw_renderer: ready\n");
   fflush(stderr);
 
-  while (fgets(line, sizeof(line), stdin) != NULL) {
-    id[0] = '\0';
-    command[0] = '\0';
+  char line[4096];
 
-    if (extract_value(line, "id", id, sizeof(id)) == NULL) {
-      strcpy(id, "0");
+  for (;;) {
+    struct pollfd fds[2];
+    int nfds = 1;
+
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+
+    if (g_ctx.display != NULL) {
+      /* Flush any pending outgoing requests before waiting so the
+       * compositor sees our latest state (e.g. surface commits). */
+      wl_display_flush(g_ctx.display);
+      fds[1].fd = wl_display_get_fd(g_ctx.display);
+      fds[1].events = POLLIN;
+      fds[1].revents = 0;
+      nfds = 2;
     }
 
-    if (extract_value(line, "command", command, sizeof(command)) == NULL) {
-      strcpy(command, "unknown");
-    }
-
-    fprintf(stderr, "fw_renderer: command=%s id=%s\n", command, id);
-    fflush(stderr);
-
-    if (strcmp(command, "shutdown") == 0) {
-      destroy_context(&g_ctx);
-      write_reply(id, "ok", command, "renderer stopping");
+    int ready = poll(fds, (nfds_t)nfds, -1);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       break;
     }
 
-    if (strcmp(command, "ping") == 0) {
-      write_reply(id, "ok", command, "pong from native Wayland renderer");
-      continue;
+    if (nfds == 2 && (fds[1].revents & POLLIN)) {
+      if (wl_display_dispatch(g_ctx.display) < 0) {
+        fprintf(stderr, "fw_renderer: Wayland connection lost\n");
+        fflush(stderr);
+        break;
+      }
     }
 
-    if (strcmp(command, "status") == 0) {
-      write_reply(id, "ok", command, g_ctx.display != NULL ? "native renderer ready" : "renderer not connected");
-      continue;
-    }
-
-    if (strcmp(command, "apply") == 0) {
-      char path[2048];
-      char scaling[128];
-      char reply[512];
-
-      if (extract_value(line, "path", path, sizeof(path)) == NULL || path[0] == '\0') {
-        write_reply(id, "error", command, "missing wallpaper path");
+    if (fds[0].revents & POLLIN) {
+      int rc = read_command_line(line, sizeof(line));
+      if (rc == 0) {
+        break; /* EOF: parent (Elixir) closed the pipe */
+      }
+      if (rc < 0) {
+        write_reply("0", "error", "unknown", "command line too long");
         continue;
       }
-
-      if (extract_value(line, "scaling", scaling, sizeof(scaling)) == NULL) {
-        scaling[0] = '\0';
-      }
-
-      if (apply_wallpaper(path, scaling, reply, sizeof(reply)) != 0) {
-        write_reply(id, "error", command, reply);
-      } else {
-        write_reply(id, "ok", command, reply);
-      }
-
-      continue;
+      handle_command_line(line);
+    } else if (fds[0].revents & (POLLHUP | POLLERR)) {
+      break;
     }
-
-    write_reply(id, "error", command, "unsupported command");
   }
 
   destroy_context(&g_ctx);

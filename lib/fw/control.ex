@@ -25,27 +25,28 @@ defmodule FW.Control do
     {:reply, route(request), state}
   end
 
-  defp route(%{"command" => "ping"}) do
+  @doc false
+  def route(%{"command" => "ping"}) do
     %{status: "ok", data: %{message: "pong"}}
   end
 
-  defp route(%{"command" => "status"}) do
+  def route(%{"command" => "status"}) do
     settings = FW.Settings.get()
 
     %{
       status: "ok",
       data: %{
-        daemon: settings.daemon,
-        log_level: settings.log_level,
-        wallpaper: settings.wallpaper,
-        monitors: settings.monitors,
-        renderer: settings.renderer,
+        daemon: settings["daemon"],
+        log_level: settings["log_level"],
+        wallpaper: settings["wallpaper"],
+        monitors: settings["monitors"],
+        renderer: settings["renderer"],
         port: FW.PortServer.status()
       }
     }
   end
 
-  defp route(%{"command" => "stop"}) do
+  def route(%{"command" => "stop"}) do
     Task.start(fn ->
       Process.sleep(50)
       System.stop(0)
@@ -54,7 +55,7 @@ defmodule FW.Control do
     %{status: "ok", data: %{message: "daemon stopping"}}
   end
 
-  defp route(%{"command" => "config", "payload" => %{"level" => level}}) do
+  def route(%{"command" => "config", "payload" => %{"level" => level}}) do
     case normalize_level(level) do
       {:ok, normalized} ->
         FW.Settings.set_log_level(normalized)
@@ -64,10 +65,10 @@ defmodule FW.Control do
     end
   end
 
-  defp route(%{"command" => "apply", "payload" => payload}) do
+  def route(%{"command" => "apply", "payload" => %{"path" => path} = payload}) when is_binary(path) and path != "" do
     case FW.PortServer.request("apply", payload) do
       {:ok, %{"status" => "ok"} = renderer_reply} ->
-        updated = FW.Settings.update(%{wallpaper: payload})
+        updated = FW.Settings.update(%{"wallpaper" => payload})
         %{status: "ok", data: %{settings: updated, renderer: renderer_reply}}
 
       {:ok, %{"status" => "error", "message" => message} = renderer_reply} ->
@@ -84,11 +85,15 @@ defmodule FW.Control do
     end
   end
 
-  defp route(%{"command" => other}) do
+  def route(%{"command" => "apply"}) do
+    error("missing or empty 'path' in apply payload")
+  end
+
+  def route(%{"command" => other}) do
     error("unsupported command: #{other}")
   end
 
-  defp route(_request) do
+  def route(_request) do
     error("invalid request")
   end
 
