@@ -9,7 +9,8 @@
 - Port-обвязка для `priv/fw_renderer`
 - сохранение состояния в `priv/fw.state.json`
 - сборка C-бинарника через `mix compile`
-- рабочий backend для KDE Plasma Wayland через DBus
+- нативный Wayland backend через `wlr-layer-shell`
+- поддержка compositors вроде sway, wayfire, Hyprland и других реализаций протокола
 
 ## Требования
 
@@ -50,8 +51,8 @@ mix fw apply /path/to/wallpaper.jpg
 mix fw stop
 ```
 
-На KDE Plasma Wayland команда `fw apply` меняет обои через Plasma DBus API.
-Если backend не поддерживается, команда вернёт понятную ошибку.
+На Wayland-композиторах с `wlr-layer-shell` команда `fw apply` создаёт фоновую layer-surface на каждом мониторе и рисует изображение нативно через `wl_shm`.
+Если compositor не поддерживает этот протокол, команда вернёт понятную ошибку.
 
 ## Команды CLI
 
@@ -87,4 +88,4 @@ mix release
 
 ## Дальше
 
-Сейчас это рабочий каркас с daemon-архитектурой, IPC и работающим wallpaper backend для KDE Plasma Wayland. Следующий шаг — заменить текущую интеграцию на более низкоуровневую Wayland/Cairo/DMA-BUF реализацию и добавить полноценное управление несколькими мониторами.
+Сейчас это рабочий каркас с daemon-архитектурой, IPC и нативным Wayland wallpaper backend. Следующий шаг — добавить более продвинутый рендеринг, DMA-BUF/оптимизации и полноценную реакцию на hotplug мониторов.
