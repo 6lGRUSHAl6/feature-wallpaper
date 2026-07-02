@@ -27,3 +27,4 @@ fw-*.tar
 # Logs
 *.log
 
+/fw
