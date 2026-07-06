@@ -4,7 +4,7 @@ defmodule FW.MixProject do
   def project do
     [
       app: :fw,
-      version: "0.1.0",
+      version: "0.1.1",
       escript: [main_module: FW.CLI, app: nil],
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,

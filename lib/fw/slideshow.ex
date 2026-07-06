@@ -26,7 +26,7 @@ defmodule FW.Slideshow do
 
   require Logger
 
-  @image_extensions ~w(.jpg .jpeg .png .webp .bmp .gif)
+  @image_extensions ~w(.jpg .jpeg .png .webp .bmp .gif .avif .ico .svg .tif .tiff .jxl)
   @restore_retry_interval_ms 1_000
   @restore_max_attempts 15
 
