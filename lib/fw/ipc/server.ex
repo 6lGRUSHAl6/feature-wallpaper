@@ -18,7 +18,9 @@ defmodule FW.IPC.Server do
     host = Application.get_env(:fw, :daemon_host, {127, 0, 0, 1})
     port = Application.get_env(:fw, :daemon_port, 47_788)
 
-    {:ok, listen_socket} = :gen_tcp.listen(port, [:binary, packet: :line, active: false, reuseaddr: true, ip: host])
+    {:ok, listen_socket} =
+      :gen_tcp.listen(port, [:binary, packet: :line, active: false, reuseaddr: true, ip: host])
+
     acceptor = spawn_link(fn -> accept_loop(listen_socket) end)
 
     {:ok, %{listen_socket: listen_socket, acceptor: acceptor, host: host, port: port}}

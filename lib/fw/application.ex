@@ -9,6 +9,7 @@ defmodule FW.Application do
       FW.Settings,
       FW.PortServer,
       FW.Control,
+      FW.Slideshow,
       FW.IPC.Server
     ]
 

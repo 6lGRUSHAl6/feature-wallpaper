@@ -21,7 +21,8 @@ defmodule FW.JSON do
           _ -> {:error, :trailing_data}
         end
 
-      {:error, reason} -> {:error, reason}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -55,9 +56,11 @@ defmodule FW.JSON do
   defp escape_string(<<?\n, rest::binary>>), do: ["\\n", escape_string(rest)]
   defp escape_string(<<?\r, rest::binary>>), do: ["\\r", escape_string(rest)]
   defp escape_string(<<?\t, rest::binary>>), do: ["\\t", escape_string(rest)]
+
   defp escape_string(<<char::utf8, rest::binary>>) when char < 0x20 do
     ["\\u", hex4(char), escape_string(rest)]
   end
+
   defp escape_string(<<char::utf8, rest::binary>>), do: [<<char::utf8>>, escape_string(rest)]
 
   defp hex4(codepoint) do
@@ -112,28 +115,47 @@ defmodule FW.JSON do
 
   defp parse_string(<<"\\", rest::binary>>, acc) do
     case rest do
-      <<34, tail::binary>> -> parse_string(tail, <<acc::binary, 34>>)
-      <<"\\", tail::binary>> -> parse_string(tail, <<acc::binary, 92>>)
-      <<"/", tail::binary>> -> parse_string(tail, <<acc::binary, 47>>)
-      <<"b", tail::binary>> -> parse_string(tail, <<acc::binary, 8>>)
-      <<"f", tail::binary>> -> parse_string(tail, <<acc::binary, 12>>)
-      <<"n", tail::binary>> -> parse_string(tail, <<acc::binary, 10>>)
-      <<"r", tail::binary>> -> parse_string(tail, <<acc::binary, 13>>)
-      <<"t", tail::binary>> -> parse_string(tail, <<acc::binary, 9>>)
+      <<34, tail::binary>> ->
+        parse_string(tail, <<acc::binary, 34>>)
+
+      <<"\\", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 92>>)
+
+      <<"/", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 47>>)
+
+      <<"b", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 8>>)
+
+      <<"f", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 12>>)
+
+      <<"n", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 10>>)
+
+      <<"r", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 13>>)
+
+      <<"t", tail::binary>> ->
+        parse_string(tail, <<acc::binary, 9>>)
+
       <<"u", hex::binary-size(4), tail::binary>> ->
         case Integer.parse(hex, 16) do
           {codepoint, ""} -> parse_string(tail, <<acc::binary, codepoint::utf8>>)
           _ -> {:error, :invalid_unicode_escape}
         end
 
-      _ -> {:error, :invalid_escape}
+      _ ->
+        {:error, :invalid_escape}
     end
   end
 
-  defp parse_string(<<char::utf8, rest::binary>>, acc), do: parse_string(rest, <<acc::binary, char::utf8>>)
+  defp parse_string(<<char::utf8, rest::binary>>, acc),
+    do: parse_string(rest, <<acc::binary, char::utf8>>)
+
   defp parse_string(<<>>, _acc), do: {:error, :unterminated_string}
 
-defp parse_number(binary) do
+  defp parse_number(binary) do
     regex = ~r/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/
 
     case Regex.run(regex, binary, capture: :first) do
@@ -141,7 +163,7 @@ defp parse_number(binary) do
         rest = binary_part(binary, byte_size(number), byte_size(binary) - byte_size(number))
 
         case Integer.parse(number) do
-          {int, ""} -> 
+          {int, ""} ->
             {:ok, int, rest}
 
           _other ->
@@ -151,7 +173,8 @@ defp parse_number(binary) do
             end
         end
 
-      _ -> {:error, :invalid_number}
+      _ ->
+        {:error, :invalid_number}
     end
   end
 end

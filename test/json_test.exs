@@ -93,7 +93,7 @@ defmodule FW.JSONTest do
     test "returns an error for malformed JSON instead of raising" do
       assert {:error, _reason} = FW.JSON.decode("{not valid json")
       assert {:error, _reason} = FW.JSON.decode("")
-     assert {:error, _reason} = FW.JSON.decode(~s[{"a":1)])
+      assert {:error, _reason} = FW.JSON.decode(~s[{"a":1)])
     end
 
     test "returns an error for trailing data after a valid value" do

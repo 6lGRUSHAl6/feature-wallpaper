@@ -41,10 +41,13 @@ defmodule FW.Release.InitUnits do
     :ok = File.mkdir_p(init_dir)
 
     init = detect_init()
-    username = System.get_env("FW_INSTALL_USER") ||
-               System.get_env("USER") ||
-               System.get_env("LOGNAME") ||
-               "nobody"
+
+    username =
+      System.get_env("FW_INSTALL_USER") ||
+        System.get_env("USER") ||
+        System.get_env("LOGNAME") ||
+        "nobody"
+
     skip_install? = System.get_env("FW_NO_INSTALL") not in [nil, ""]
 
     log("init system : #{init}")
@@ -70,9 +73,9 @@ defmodule FW.Release.InitUnits do
   def detect_init do
     cond do
       systemd?() -> :systemd
-      runit?()   -> :runit
-      s6?()      -> :s6
-      true       -> :unknown
+      runit?() -> :runit
+      s6?() -> :s6
+      true -> :unknown
     end
   end
 
@@ -86,9 +89,9 @@ defmodule FW.Release.InitUnits do
   end
 
   defp install(:systemd, release, _username) do
-    bin   = bin_path(release)
+    bin = bin_path(release)
     dest_dir = Path.expand("~/.config/systemd/user")
-    dest     = Path.join(dest_dir, "fw.service")
+    dest = Path.join(dest_dir, "fw.service")
 
     :ok = File.mkdir_p(dest_dir)
 
@@ -98,13 +101,13 @@ defmodule FW.Release.InitUnits do
 
     cmd!("systemctl", ["--user", "daemon-reload"])
     cmd!("systemctl", ["--user", "enable", "fw"])
-    cmd!("systemctl", ["--user", "start",  "fw"])
+    cmd!("systemctl", ["--user", "start", "fw"])
     log("✓ fw enabled and started via systemd")
     log("  journalctl --user -u fw -f")
   end
 
   defp install(:runit, release, username) do
-    bin  = bin_path(release)
+    bin = bin_path(release)
     dest = "/etc/sv/fw"
     symlink = "/var/service/fw"
 
@@ -113,10 +116,10 @@ defmodule FW.Release.InitUnits do
     :ok = File.mkdir_p(Path.join(tmp, "log"))
     uid = uid_for(username)
 
-    File.write!(Path.join(tmp, "run"),        runit_run(bin, username, uid), [:raw])
-    File.write!(Path.join(tmp, "finish"),      runit_finish(), [:raw])
+    File.write!(Path.join(tmp, "run"), runit_run(bin, username, uid), [:raw])
+    File.write!(Path.join(tmp, "finish"), runit_finish(), [:raw])
     File.write!(Path.join(Path.join(tmp, "log"), "run"), runit_log_run(), [:raw])
-    File.chmod!(Path.join(tmp, "run"),    0o755)
+    File.chmod!(Path.join(tmp, "run"), 0o755)
     File.chmod!(Path.join(tmp, "finish"), 0o755)
     File.chmod!(Path.join(Path.join(tmp, "log"), "run"), 0o755)
 
@@ -135,27 +138,27 @@ defmodule FW.Release.InitUnits do
   end
 
   defp install(:s6, release, username) do
-    bin      = bin_path(release)
+    bin = bin_path(release)
     dest_base = "/etc/s6/sv"
-    dest_fw   = Path.join(dest_base, "fw")
-    dest_log  = Path.join(dest_base, "fw-log")
+    dest_fw = Path.join(dest_base, "fw")
+    dest_log = Path.join(dest_base, "fw-log")
 
     tmp = Path.join(System.tmp_dir!(), "fw-s6-#{:os.getpid()}")
-    tmp_fw  = Path.join(tmp, "fw")
+    tmp_fw = Path.join(tmp, "fw")
     tmp_log = Path.join(tmp, "fw-log")
     :ok = File.mkdir_p(tmp_fw)
     :ok = File.mkdir_p(tmp_log)
 
-    File.write!(Path.join(tmp_fw, "run"),    s6_run(bin, username), [:raw])
+    File.write!(Path.join(tmp_fw, "run"), s6_run(bin, username), [:raw])
     File.write!(Path.join(tmp_fw, "finish"), s6_finish(), [:raw])
-    File.write!(Path.join(tmp_fw, "type"),   "longrun\n")
-    File.write!(Path.join(tmp_log, "run"),   s6_log_run(), [:raw])
-    File.write!(Path.join(tmp_log, "type"),  "longrun\n")
-    File.chmod!(Path.join(tmp_fw, "run"),    0o755)
+    File.write!(Path.join(tmp_fw, "type"), "longrun\n")
+    File.write!(Path.join(tmp_log, "run"), s6_log_run(), [:raw])
+    File.write!(Path.join(tmp_log, "type"), "longrun\n")
+    File.chmod!(Path.join(tmp_fw, "run"), 0o755)
     File.chmod!(Path.join(tmp_fw, "finish"), 0o755)
-    File.chmod!(Path.join(tmp_log, "run"),   0o755)
+    File.chmod!(Path.join(tmp_log, "run"), 0o755)
 
-    cmd!("sudo", ["cp", "-r", tmp_fw,  dest_fw])
+    cmd!("sudo", ["cp", "-r", tmp_fw, dest_fw])
     cmd!("sudo", ["cp", "-r", tmp_log, dest_log])
     log("installed #{dest_fw} and #{dest_log}")
     log("✓ fw s6 service files installed")
@@ -220,7 +223,7 @@ defmodule FW.Release.InitUnits do
 
     [Unit]
     Description=fw — feature-wallpaper Wayland wallpaper daemon
-    Documentation=https://github.com/Skartorion/feature-wallpaper
+    Documentation=https://github.com/6lGRUSHAl6/feature-wallpaper/blob/main/README.md
     After=graphical-session.target
     PartOf=graphical-session.target
 
@@ -307,25 +310,25 @@ defmodule FW.Release.InitUnits do
   end
 
   defp write_runit(init_dir, release) do
-    base    = Path.join([init_dir, "runit", "fw"])
+    base = Path.join([init_dir, "runit", "fw"])
     log_dir = Path.join(base, "log")
     :ok = File.mkdir_p(log_dir)
     bin = bin_path(release)
-    write_x(Path.join(base,    "run"),    runit_run(bin, "YOURUSER", "$(id -u YOURUSER)"))
-    write_x(Path.join(base,    "finish"), runit_finish())
-    write_x(Path.join(log_dir, "run"),    runit_log_run())
+    write_x(Path.join(base, "run"), runit_run(bin, "YOURUSER", "$(id -u YOURUSER)"))
+    write_x(Path.join(base, "finish"), runit_finish())
+    write_x(Path.join(log_dir, "run"), runit_log_run())
   end
 
   defp write_s6(init_dir, release) do
-    base    = Path.join([init_dir, "s6", "fw"])
+    base = Path.join([init_dir, "s6", "fw"])
     log_dir = Path.join([init_dir, "s6", "fw-log"])
     :ok = File.mkdir_p(base)
     :ok = File.mkdir_p(log_dir)
     bin = bin_path(release)
-    write_x(Path.join(base,    "run"),    s6_run(bin, "YOURUSER"))
-    write_x(Path.join(base,    "finish"), s6_finish())
-    File.write!(Path.join(base,    "type"), "longrun\n")
-    write_x(Path.join(log_dir, "run"),    s6_log_run())
+    write_x(Path.join(base, "run"), s6_run(bin, "YOURUSER"))
+    write_x(Path.join(base, "finish"), s6_finish())
+    File.write!(Path.join(base, "type"), "longrun\n")
+    write_x(Path.join(log_dir, "run"), s6_log_run())
     File.write!(Path.join(log_dir, "type"), "longrun\n")
   end
 
@@ -374,7 +377,9 @@ defmodule FW.Release.InitUnits do
 
   defp cmd!(bin, args) do
     case System.cmd(bin, args, stderr_to_stdout: true, into: IO.stream()) do
-      {_, 0} -> :ok
+      {_, 0} ->
+        :ok
+
       {out, code} ->
         Mix.raise("Command failed (exit #{code}): #{bin} #{Enum.join(args, " ")}\n#{out}")
     end

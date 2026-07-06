@@ -31,10 +31,31 @@ defmodule FW.Control do
 
   @impl true
   def handle_info({:restore_wallpaper, attempt}, state) do
+    # If a slideshow was active last session, FW.Slideshow's own restore
+    # loop owns re-applying a wallpaper (it needs to re-derive the image
+    # list and current index anyway). Doing it here too would mean both
+    # processes independently call the renderer on boot, applying two
+    # different images back to back for no reason.
+    case FW.Settings.get()["slideshow"] do
+      %{"active" => true} ->
+        :ok
+
+      _ ->
+        restore_static_wallpaper(attempt)
+    end
+
+    {:noreply, state}
+  end
+
+  defp restore_static_wallpaper(attempt) do
     case FW.Settings.get()["wallpaper"] do
       %{"path" => path} when is_binary(path) and path != "" ->
         if File.exists?(path) do
-          case apply_wallpaper(%{"path" => path} |> maybe_put_scaling(attempt) |> restore_payload()) do
+          case apply_wallpaper(
+                 %{"path" => path}
+                 |> maybe_put_scaling(attempt)
+                 |> restore_payload()
+               ) do
             {:ok, _} ->
               Logger.info("restored wallpaper from last session: #{path}")
 
@@ -61,8 +82,6 @@ defmodule FW.Control do
       _ ->
         :ok
     end
-
-    {:noreply, state}
   end
 
   @doc false
@@ -101,11 +120,21 @@ defmodule FW.Control do
         FW.Settings.set_log_level(normalized)
         %{status: "ok", data: %{log_level: normalized}}
 
+      {:error, reason} ->
+        error(reason)
+    end
+  end
+
+  def route(%{"command" => "apply", "payload" => %{"dir" => dir} = payload})
+      when is_binary(dir) and dir != "" do
+    case FW.Slideshow.start(payload) do
+      {:ok, status} -> %{status: "ok", data: status}
       {:error, reason} -> error(reason)
     end
   end
 
-  def route(%{"command" => "apply", "payload" => %{"path" => path} = payload}) when is_binary(path) and path != "" do
+  def route(%{"command" => "apply", "payload" => %{"path" => path} = payload})
+      when is_binary(path) and path != "" do
     case apply_wallpaper(payload) do
       {:ok, %{settings: updated, renderer: renderer_reply}} ->
         %{status: "ok", data: %{settings: updated, renderer: renderer_reply}}
@@ -125,6 +154,19 @@ defmodule FW.Control do
     error("missing or empty 'path' in apply payload")
   end
 
+  def route(%{"command" => "slideshow", "payload" => %{"action" => "stop"}}) do
+    FW.Slideshow.stop()
+    %{status: "ok", data: %{message: "slideshow stopped"}}
+  end
+
+  def route(%{"command" => "slideshow", "payload" => %{"action" => "status"}}) do
+    %{status: "ok", data: FW.Slideshow.status()}
+  end
+
+  def route(%{"command" => "slideshow"}) do
+    error("usage: fw slideshow stop | fw slideshow status")
+  end
+
   def route(%{"command" => other}) do
     error("unsupported command: #{other}")
   end
@@ -133,9 +175,12 @@ defmodule FW.Control do
     error("invalid request")
   end
 
-  # Shared by the IPC "apply" command and the startup wallpaper-restore path,
-  # so both go through identical validation/persistence logic.
-  defp apply_wallpaper(payload) do
+  # Shared by the IPC "apply" command, the startup wallpaper-restore path,
+  # and FW.Slideshow (each slideshow tick applies its current image through
+  # this same function), so all three go through identical
+  # validation/persistence logic instead of duplicating it.
+  @doc false
+  def apply_wallpaper(payload) do
     case FW.PortServer.request("apply", payload) do
       {:ok, %{"status" => "ok"} = renderer_reply} ->
         updated = FW.Settings.update(%{"wallpaper" => payload})

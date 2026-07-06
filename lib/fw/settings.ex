@@ -20,7 +20,15 @@ defmodule FW.Settings do
     "log_level" => "info",
     "renderer" => %{"binary" => "priv/fw_renderer"},
     "wallpaper" => %{"path" => nil, "scaling" => "fit", "transition" => "none"},
-    "monitors" => []
+    "monitors" => [],
+    "slideshow" => %{
+      "active" => false,
+      "dir" => nil,
+      "interval_ms" => nil,
+      "shuffle" => false,
+      "scaling" => nil,
+      "transition" => nil
+    }
   }
 
   def start_link(_opts) do
@@ -97,7 +105,9 @@ defmodule FW.Settings do
   # Only merges plain maps recursively; any other conflicting value type is
   # simply replaced by the right-hand side (last write wins).
   defp deep_merge(left, right) when is_map(left) and is_map(right) do
-    Map.merge(left, right, fn _key, left_value, right_value -> deep_merge(left_value, right_value) end)
+    Map.merge(left, right, fn _key, left_value, right_value ->
+      deep_merge(left_value, right_value)
+    end)
   end
 
   defp deep_merge(_left, right), do: right
@@ -120,7 +130,8 @@ defmodule FW.Settings do
       "log_level" => Map.get(decoded, "log_level", @default_state["log_level"]),
       "renderer" => normalize_renderer(Map.get(decoded, "renderer", %{})),
       "wallpaper" => normalize_wallpaper(Map.get(decoded, "wallpaper", %{})),
-      "monitors" => Map.get(decoded, "monitors", @default_state["monitors"])
+      "monitors" => Map.get(decoded, "monitors", @default_state["monitors"]),
+      "slideshow" => normalize_slideshow(Map.get(decoded, "slideshow", %{}))
     }
   end
 
@@ -144,6 +155,21 @@ defmodule FW.Settings do
       "path" => Map.get(wallpaper, "path", @default_state["wallpaper"]["path"]),
       "scaling" => Map.get(wallpaper, "scaling", @default_state["wallpaper"]["scaling"]),
       "transition" => Map.get(wallpaper, "transition", @default_state["wallpaper"]["transition"])
+    }
+  end
+
+  # Every field defaults to nil/false rather than raising when absent, since
+  # this also runs against whatever was last persisted to disk — a partial
+  # or stale "slideshow" map here must never crash the daemon on boot.
+  defp normalize_slideshow(%{} = slideshow) do
+    %{
+      "active" => Map.get(slideshow, "active", @default_state["slideshow"]["active"]),
+      "dir" => Map.get(slideshow, "dir", @default_state["slideshow"]["dir"]),
+      "interval_ms" =>
+        Map.get(slideshow, "interval_ms", @default_state["slideshow"]["interval_ms"]),
+      "shuffle" => Map.get(slideshow, "shuffle", @default_state["slideshow"]["shuffle"]),
+      "scaling" => Map.get(slideshow, "scaling", @default_state["slideshow"]["scaling"]),
+      "transition" => Map.get(slideshow, "transition", @default_state["slideshow"]["transition"])
     }
   end
 

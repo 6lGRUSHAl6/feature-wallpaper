@@ -108,7 +108,12 @@ defmodule FW.PortServer do
   end
 
   defp open_port(state) do
-    case Port.open({:spawn_executable, state.binary}, [:binary, :exit_status, :use_stdio, :stderr_to_stdout]) do
+    case Port.open({:spawn_executable, state.binary}, [
+           :binary,
+           :exit_status,
+           :use_stdio,
+           :stderr_to_stdout
+         ]) do
       port when is_port(port) -> %{state | port: port}
     end
   end

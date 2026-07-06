@@ -60,18 +60,24 @@ defmodule FW.CLITest do
     end
 
     test "includes a valid --transition flag" do
-      assert {:ok, payload} = FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--transition", "fade"])
+      assert {:ok, payload} =
+               FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--transition", "fade"])
+
       assert payload["transition"] == "fade"
     end
 
     test "rejects an invalid --scaling value instead of silently passing it through" do
-      assert {:error, message} = FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--scaling", "bogus"])
+      assert {:error, message} =
+               FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--scaling", "bogus"])
+
       assert message =~ "invalid --scaling value"
       assert message =~ "bogus"
     end
 
     test "rejects an invalid --transition value" do
-      assert {:error, message} = FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--transition", "bogus"])
+      assert {:error, message} =
+               FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--transition", "bogus"])
+
       assert message =~ "invalid --transition value"
     end
 
@@ -82,7 +88,13 @@ defmodule FW.CLITest do
 
     test "accepts both --scaling and --transition together" do
       assert {:ok, payload} =
-               FW.CLI.parse_payload("apply", ["/tmp/pic.png", "--scaling", "fit", "--transition", "none"])
+               FW.CLI.parse_payload("apply", [
+                 "/tmp/pic.png",
+                 "--scaling",
+                 "fit",
+                 "--transition",
+                 "none"
+               ])
 
       assert payload["scaling"] == "fit"
       assert payload["transition"] == "none"

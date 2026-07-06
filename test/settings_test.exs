@@ -28,7 +28,10 @@ defmodule FW.SettingsTest do
   end
 
   test "update/1 with a string-keyed payload (the normal JSON-decoded shape) merges cleanly" do
-    updated = FW.Settings.update(%{"wallpaper" => %{"path" => "/tmp/settings_test_a.png", "scaling" => "fill"}})
+    updated =
+      FW.Settings.update(%{
+        "wallpaper" => %{"path" => "/tmp/settings_test_a.png", "scaling" => "fill"}
+      })
 
     assert updated["wallpaper"]["path"] == "/tmp/settings_test_a.png"
     assert updated["wallpaper"]["scaling"] == "fill"

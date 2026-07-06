@@ -14,7 +14,7 @@ defmodule FW.IPC.Client do
     }
 
     with {:ok, socket} <- connect(host, port),
-          :ok <- :gen_tcp.send(socket, FW.JSON.encode!(request) <> "\n"),
+         :ok <- :gen_tcp.send(socket, FW.JSON.encode!(request) <> "\n"),
          {:ok, reply} <- recv_json(socket) do
       :gen_tcp.close(socket)
       {:ok, reply}
