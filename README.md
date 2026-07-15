@@ -2,6 +2,8 @@
 
 # fw — feature wallpaper
 
+[ru Русский](README.md) · [en English](README.en.md)
+
 **Нативный менеджер обоев для Linux / Wayland, написанный на Elixir + C.**
 
 Daemon на OTP, лёгкий CLI и рендерер поверх `wlr-layer-shell` — без Python, без GTK-обвязки, без лишнего веса.
@@ -113,8 +115,8 @@ fw stop                            # остановить daemon
 
 ```
 ┌─────────────┐      TCP IPC       ┌──────────────┐      Port      ┌────────────────┐
-│   fw CLI    │ ─────────────────▶ │  fw daemon    │ ─────────────▶ │  fw_renderer     │
-│ (mix fw ..) │                    │  (Elixir/OTP) │                │  (C, wl-client)  │
+│   fw CLI    │ ─────────────────▶ │  fw daemon   │ ─────────────▶│  fw_renderer  │
+│ (mix fw ..) │                    │  (Elixir/OTP)│                │  (C, wl-client)│
 └─────────────┘                    └──────────────┘                └────────────────┘
                                           │                                  │
                                           ▼                                  ▼
