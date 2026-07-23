@@ -125,30 +125,28 @@ defmodule FW.Control do
     end
   end
 
-  def route(%{"command" => "apply", "payload" => %{"dir" => dir} = payload})
-      when is_binary(dir) and dir != "" do
-    case FW.Slideshow.start(payload) do
-      {:ok, status} -> %{status: "ok", data: status}
-      {:error, reason} -> error(reason)
-    end
+def route(%{"command" => "apply", "payload" => %{"path" => path} = payload})
+    when is_binary(path) and path != "" do
+  # A plain `fw apply <path>` means "show this static wallpaper", full
+  # stop. If a slideshow is running, it must be stopped here — otherwise
+  # its timer keeps ticking and silently replaces this image with the
+  # next one in the directory a moment later.
+  FW.Slideshow.stop()
+
+  case apply_wallpaper(payload) do
+    {:ok, %{settings: updated, renderer: renderer_reply}} ->
+      %{status: "ok", data: %{settings: updated, renderer: renderer_reply}}
+
+    {:error, {:rejected, message, renderer_reply}} ->
+      %{status: "error", error: message, renderer: renderer_reply}
+
+    {:error, {:invalid_response, renderer_reply}} ->
+      %{status: "error", error: "renderer returned invalid response", renderer: renderer_reply}
+
+    {:error, reason} ->
+      %{status: "error", error: inspect(reason)}
   end
-
-  def route(%{"command" => "apply", "payload" => %{"path" => path} = payload})
-      when is_binary(path) and path != "" do
-    case apply_wallpaper(payload) do
-      {:ok, %{settings: updated, renderer: renderer_reply}} ->
-        %{status: "ok", data: %{settings: updated, renderer: renderer_reply}}
-
-      {:error, {:rejected, message, renderer_reply}} ->
-        %{status: "error", error: message, renderer: renderer_reply}
-
-      {:error, {:invalid_response, renderer_reply}} ->
-        %{status: "error", error: "renderer returned invalid response", renderer: renderer_reply}
-
-      {:error, reason} ->
-        %{status: "error", error: inspect(reason)}
-    end
-  end
+end
 
   def route(%{"command" => "apply"}) do
     error("missing or empty 'path' in apply payload")
