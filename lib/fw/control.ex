@@ -28,7 +28,7 @@ defmodule FW.Control do
   def handle_call({:dispatch, request}, _from, state) do
     {:reply, route(request), state}
   end
-
+ 
   @impl true
   def handle_info({:restore_wallpaper, attempt}, state) do
     # If a slideshow was active last session, FW.Slideshow's own restore
@@ -124,6 +124,14 @@ defmodule FW.Control do
         error(reason)
     end
   end
+
+def route(%{"command" => "apply", "payload" => %{"dir" => dir} = payload})
+    when is_binary(dir) and dir != "" do
+  case FW.Slideshow.start(payload) do
+    {:ok, status} -> %{status: "ok", data: status}
+    {:error, reason} -> error(reason)
+  end
+end
 
 def route(%{"command" => "apply", "payload" => %{"path" => path} = payload})
     when is_binary(path) and path != "" do

@@ -230,8 +230,15 @@ defmodule FW.Release.InitUnits do
     [Service]
     Type=simple
     ExecStart=#{bin} start
-    ExecStop=#{bin} stop
 
+    # No ExecStop here on purpose: `#{bin} stop` shells out to a distributed-
+    # Erlang RPC call (--rpc-eval) against the running node via epmd. That
+    # connection can intermittently fail with :noconnection (e.g. right after
+    # start, or during rapid restarts), which makes systemd treat the stop as
+    # a *failed* control process and trigger Restart=on-failure — causing the
+    # daemon to flap on its own. Sending KillSignal directly to the main PID
+    # is what the app's own SIGTERM handler is for, and doesn't depend on
+    # distributed Erlang being reachable.
     KillSignal=SIGTERM
     KillMode=mixed
     TimeoutStopSec=10
